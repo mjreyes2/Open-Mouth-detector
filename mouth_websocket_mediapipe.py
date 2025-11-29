@@ -1,4 +1,15 @@
 import sys
+import os
+
+# Get the absolute path to the project's root directory
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# Construct the path to the site-packages directory of the correct virtual environment
+venv_path = os.path.join(script_dir, '.venv311', 'Lib', 'site-packages')
+
+# Add the site-packages directory to the Python path
+if venv_path not in sys.path:
+    sys.path.insert(0, venv_path)
+
 import asyncio
 import websockets
 import json
@@ -62,7 +73,10 @@ latest_data = {
     "glare_level": 0.0,
     "has_glasses": False,
     "source": "mediapipe",
-    "type": "face_tracking"
+    "type": "face_tracking",
+    "blink_left": 0.0,
+    "blink_right": 0.0,
+    "blink": 0.0
 }
 data_lock = threading.Lock()
 clients = set()
@@ -105,6 +119,9 @@ class TrackingData(TypedDict, total=False):
     smile_expression: float
     frown_expression: float
     lip_color_intensity: float
+    blink_left: float
+    blink_right: float
+    blink: float
 
 def calculate_distance(p1, p2):
     """Calculate Euclidean distance between two landmarks."""
@@ -156,6 +173,9 @@ def detect_face_and_mouth_mediapipe(frame, face_mesh) -> TrackingData:
         "smile_expression": 0.0,
         "frown_expression": 0.0,
         "lip_color_intensity": 0.0,
+        "blink_left": 0.0,
+        "blink_right": 0.0,
+        "blink": 0.0,
     }
     
     if results.multi_face_landmarks:
@@ -240,6 +260,37 @@ def detect_face_and_mouth_mediapipe(frame, face_mesh) -> TrackingData:
                 new_data["gaze_x"] = float((left_gaze_x + right_gaze_x) / 2.0)
                 new_data["gaze_y"] = float((left_gaze_y + right_gaze_y) / 2.0)
             
+            # === BLINK DETECTION ===
+            # Calculate Eye Aspect Ratio (EAR) for blink detection
+            def eye_aspect_ratio(eye_landmarks):
+                # Vertical eye landmarks (top and bottom)
+                v1 = calculate_distance(eye_landmarks[1], eye_landmarks[5])  # top to bottom left
+                v2 = calculate_distance(eye_landmarks[2], eye_landmarks[4])  # top to bottom right
+                # Horizontal eye landmark (left to right corner)
+                h = calculate_distance(eye_landmarks[0], eye_landmarks[3])  # left to right corner
+                # EAR formula
+                ear = (v1 + v2) / (2.0 * h) if h > 0 else 0
+                return ear
+            
+            # Left eye EAR calculation
+            left_eye_points = [landmarks[i] for i in [33, 160, 158, 133, 153, 144]]  # Left eye landmarks
+            if len(left_eye_points) >= 6:
+                left_ear = eye_aspect_ratio(left_eye_points)
+                # Normalize EAR (typical open eye EAR is ~0.2-0.4, closed eye is ~0.05-0.15)
+                # Convert to blink strength (0 = open, 1 = closed/blink)
+                left_blink = max(0, min(1, (0.25 - left_ear) * 6.0))
+                new_data["blink_left"] = float(left_blink)
+            
+            # Right eye EAR calculation  
+            right_eye_points = [landmarks[i] for i in [362, 385, 387, 263, 373, 380]]  # Right eye landmarks
+            if len(right_eye_points) >= 6:
+                right_ear = eye_aspect_ratio(right_eye_points)
+                right_blink = max(0, min(1, (0.25 - right_ear) * 6.0))
+                new_data["blink_right"] = float(right_blink)
+            
+            # Overall blink (average of both eyes)
+            new_data["blink"] = float((new_data["blink_left"] + new_data["blink_right"]) / 2.0)
+            
             # === HEAD POSE ESTIMATION ===
             # Using key facial landmarks for 3D pose estimation
             nose_tip = landmarks[1]
@@ -310,7 +361,7 @@ def detect_face_and_mouth_mediapipe(frame, face_mesh) -> TrackingData:
     return new_data
 
 # --- WebSocket Server Logic ---
-async def handler(websocket, path):
+async def handler(websocket):
     """Main WebSocket handler."""
     print("[SERVER] Client connected.")
     clients.add(websocket)
@@ -368,6 +419,8 @@ def camera_thread(camera_index, preview):
                             (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Emotion: {new_data.get('emotion', 'N/A')}", (10, 150),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Blink: L{new_data.get('blink_left', 0):.2f} R{new_data.get('blink_right', 0):.2f} ({new_data.get('blink', 0):.2f})",
+                            (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow('Camera Preview', frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
