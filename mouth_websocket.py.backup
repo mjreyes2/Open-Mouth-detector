@@ -1,0 +1,218 @@
+import sys
+import os
+
+# Ensure local modules in the parent Rocko folder are importable
+# This enables using `eye_strain_detector.py` without disabling any features.
+_parent_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+
+import argparse
+import asyncio
+import json
+import signal
+import threading
+import time
+from contextlib import suppress
+from pathlib import Path
+from typing import Optional, Dict, Any
+from collections import deque
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import websockets
+import logging
+
+# --- Enhanced Eyelid and Fatigue Detection ---
+try:
+    from eyelid_gesture_detector import EyelidGestureAnalyzer
+    EYELID_DETECTOR_AVAILABLE = True
+    print("[SETUP] Advanced eyelid gesture detector loaded.")
+except ImportError:
+    EYELID_DETECTOR_AVAILABLE = False
+    print("[SETUP] Advanced eyelid gesture detector not found. Basic detection will be used.")
+
+try:
+    # This will also import the EAR calculation function
+    from eye_strain_detector import FatigueDetector, calculate_eye_aspect_ratio
+    FATIGUE_DETECTOR_AVAILABLE = True
+    print("[SETUP] Advanced fatigue detector loaded.")
+except ImportError:
+    # If the advanced detector fails, define a fallback EAR function if it's missing
+    def calculate_eye_aspect_ratio(landmarks, eye_indices, frame_width, frame_height):
+        return 0.0 # Placeholder
+    FATIGUE_DETECTOR_AVAILABLE = False
+    print("[SETUP] Advanced fatigue detector not found. Basic detection will be used.")
+try:
+    from glasses_detector import GlassesClassifier
+    GLASSES_DETECTOR_AVAILABLE = True
+except ImportError:
+    GLASSES_DETECTOR_AVAILABLE = False
+    print("[SETUP] glasses-detector not available. Advanced glasses detection disabled.")
+
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+BROADCAST_INTERVAL = 1 / 45
+WEBSOCKET_PORT = 6789
+
+running = True
+payload_lock = threading.Lock()
+latest_payload = {
+    "ratio": 0.0,
+    "open": 0.0,
+    "pucker": 0.0,
+    "wide": 0.0,
+    "smile": 0.0,
+    "tongue": 0.0,
+    "shift": 0.0,
+    "detected": False,
+    "confidence": 0.0,
+    "source": "none",
+    "horizontal": 0.0,
+    "emotion": "neutral",
+    "emotion_score": 0.0,
+    "glare_level": 0.0,
+    "has_glasses": False,
+    "pursed_lips": 0.0,
+    "smile_expression": 0.0,
+    "frown_expression": 0.0,
+    "lip_color_intensity": 0.0,
+    "glasses_confidence": 0.0,
+    "glasses_type": "unknown",
+    "eyelid_gesture": None,
+    "eyelid_gesture_confidence": 0.0,
+    "left_eye_open": True,
+    "right_eye_open": True,
+    "left_eye_ar": 0.0,
+    "right_eye_ar": 0.0,
+    "blink_count": 0,
+    "is_blinking": False,
+    "blink_rate": 0.0,
+    "fatigue_level": 0.0,
+    "fatigue_alert": False,
+    "dominant_emotion": "neutral",
+    "emotion_confidence": 0.0,
+    "strain_level": 0.0,
+}
+clients: set[websockets.WebSocketServerProtocol] = set()
+clients_lock = threading.Lock()
+EMOTION_MODEL_WARNING_EMITTED = False
+
+def load_mouth_cascade() -> cv2.CascadeClassifier:
+    local_cascade = Path(__file__).with_name("haarcascade_mouth.xml")
+    if local_cascade.exists():
+        cascade = cv2.CascadeClassifier(str(local_cascade))
+        if not cascade.empty():
+            return cascade
+    fallback_path = Path(cv2.data.haarcascades) / "haarcascade_mcs_mouth.xml"
+    cascade = cv2.CascadeClassifier(str(fallback_path))
+    if cascade.empty():
+        raise RuntimeError("Unable to load a mouth cascade classifier.")
+    return cascade
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+mouth_cascade = load_mouth_cascade()
+face_cascade = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"))
+if face_cascade.empty():
+    raise RuntimeError("Unable to load face cascade classifier.")
+
+try:
+    mp
+    print("[SETUP] MediaPipe found.")
+    MEDIAPIPE_AVAILABLE = True
+except Exception:
+    print("[SETUP] MediaPipe not found. Falling back to Haar cascades.")
+    MEDIAPIPE_AVAILABLE = False
+
+def load_emotion_model() -> Optional[object]:
+    global EMOTION_MODEL_WARNING_EMITTED
+    model_dir = Path(__file__).resolve().parent.parent / "Face-detection-model"
+    json_path = model_dir / "emotiondetector.json"
+    weights_path = model_dir / "emotiondetector.h5"
+
+    if not json_path.exists() or not weights_path.exists():
+        if not EMOTION_MODEL_WARNING_EMITTED:
+            print(f"[EMOTION] Model files missing in {model_dir}.", file=sys.stderr)
+            EMOTION_MODEL_WARNING_EMITTED = True
+        return None
+
+    try:
+        from tensorflow.keras.models import model_from_json
+    except Exception as exc:
+        if not EMOTION_MODEL_WARNING_EMITTED:
+            print(f"[EMOTION] TensorFlow/Keras not available: {exc}. Emotion cues disabled.", file=sys.stderr)
+            EMOTION_MODEL_WARNING_EMITTED = True
+        return None
+
+    try:
+        with json_path.open("r", encoding="utf-8") as handle:
+            model_json = handle.read()
+        model = model_from_json(model_json)
+        model.load_weights(str(weights_path))
+        print("[EMOTION] Loaded emotion recognition model.")
+        return model
+    except Exception as exc:
+        if not EMOTION_MODEL_WARNING_EMITTED:
+            print(f"[EMOTION] Failed to load emotion model: {exc}", file=sys.stderr)
+            EMOTION_MODEL_WARNING_EMITTED = True
+        return None
+
+smile_cascade_path = Path(cv2.data.haarcascades) / "haarcascade_smile.xml"
+smile_cascade = cv2.CascadeClassifier(str(smile_cascade_path)) if smile_cascade_path.exists() else None
+if smile_cascade is not None and smile_cascade.empty():
+    smile_cascade = None
+
+cap_lock = threading.Lock()
+cap: Optional[cv2.VideoCapture] = None
+
+emotion_model_lock = threading.Lock()
+emotion_model = None
+EMOTION_LABELS = {0: "angry", 1: "disgust", 2: "fear", 3: "happy", 4: "sad", 5: "surprise", 6: "neutral"}
+EMOTION_PREDICTION_INTERVAL = 0.9
+EMOTION_SMOOTHING = 0.65
+EMOTION_DECAY = 0.92
+EMOTION_IDLE_THRESHOLD = 0.12
+
+GLARE_THRESHOLD = 240
+GLASSES_FRAME_REGION_RATIO = 0.15
+GLARE_COMPENSATION_FACTOR = 0.85
+
+glasses_classifier_lock = threading.Lock()
+glasses_classifier = None
+eyelid_analyzer_lock = threading.Lock()
+eyelid_analyzer = None
+fatigue_detector_lock = threading.Lock()
+fatigue_detector = None
+
+def initialize_enhanced_detectors():
+    global glasses_classifier, eyelid_analyzer, fatigue_detector
+    
+    if GLASSES_DETECTOR_AVAILABLE:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            with glasses_classifier_lock:
+                glasses_classifier = GlassesClassifier(size="small", kind="eyeglasses", device=device)
+            print(f"[SETUP] Glasses detector initialized on {device}")
+        except Exception as e:
+            print(f"[SETUP] Failed to initialize glasses detector: {e}")
+    
+    if EYELID_DETECTOR_AVAILABLE:
+        try:
+            with eyelid_analyzer_lock:
+                eyelid_analyzer = EyelidGestureAnalyzer()
+            print("[SETUP] Advanced Eyelid gesture analyzer initialized")
+        except Exception as e:
+            print(f"[SETUP] Failed to initialize advanced eyelid gesture analyzer: {e}")
+    
+    if FATIGUE_DETECTOR_AVAILABLE:
+        try:
+            with fatigue_detector_lock:
+                fatigue_detector = FatigueDetector()
+            print("[SETUP] Advanced Fatigue detector initialized")
+        except Exception as e:
+            print(f"[SETUP] Failed to initialize advanced fatigue detector: {e}")
+# ... (rest of the file)

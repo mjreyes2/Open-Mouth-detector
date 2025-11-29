@@ -1,4 +1,5 @@
-opencv-python==4.8.1.78
-numpy>=1.21
-websockets>=12,<13
-mediapipe==0.10.18
+opencv-python>=4.8.0
+numpy<2.0
+websockets>=11.0
+mediapipe>=0.10.0
+deepface>=0.0.89
