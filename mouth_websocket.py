@@ -13,11 +13,21 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import websockets
+import json
+import argparse
+import threading
+import logging
+import os
+from pathlib import Path
+from contextlib import suppress
+from typing import Optional, Dict, Any
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 BROADCAST_INTERVAL = 1 / 45  # seconds (faster updates reduce perceived latency)
 WEBSOCKET_PORT = 6789
+from tensorflow.keras.models import model_from_json
+from tensorflow.keras.preprocessing.image import img_to_array
 
 running = True
 payload_lock = threading.Lock()
@@ -40,6 +50,11 @@ clients: set[websockets.WebSocketServerProtocol] = set()
 clients_lock = threading.Lock()
 EMOTION_MODEL_WARNING_EMITTED = False
 
+# --- Constants and Configuration ---
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+BROADCAST_INTERVAL = 1 / 45  # ~45 FPS
+WEBSOCKET_PORT = 6789
 
 def load_mouth_cascade() -> cv2.CascadeClassifier:
     local_cascade = Path(__file__).with_name("haarcascade_mouth.xml")
@@ -52,13 +67,24 @@ def load_mouth_cascade() -> cv2.CascadeClassifier:
     if cascade.empty():
         raise RuntimeError("Unable to load a mouth cascade classifier. Please verify the XML path.")
     return cascade
+# Suppress TensorFlow logging
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 
 mouth_cascade = load_mouth_cascade()
+# --- Model Loading ---
 face_cascade = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"))
 if face_cascade.empty():
     raise RuntimeError("Unable to load face cascade classifier. Check your OpenCV installation.")
 
+try:
+    import mediapipe as mp
+    print("[SETUP] MediaPipe found.")
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    print("[SETUP] MediaPipe not found. Falling back to Haar cascades.")
+    MEDIAPIPE_AVAILABLE = False
 
 def load_emotion_model() -> Optional[object]:
     """Load the optional emotion recognition model if TensorFlow is available."""
@@ -75,6 +101,7 @@ def load_emotion_model() -> Optional[object]:
                 file=sys.stderr,
             )
             EMOTION_MODEL_WARNING_EMITTED = True
+        print(f"[EMOTION] Model files missing. Emotion detection disabled.", file=sys.stderr)
         return None
 
     try:
@@ -83,6 +110,7 @@ def load_emotion_model() -> Optional[object]:
         if not EMOTION_MODEL_WARNING_EMITTED:
             print(f"[EMOTION] TensorFlow/Keras not available: {exc}. Emotion cues disabled.", file=sys.stderr)
             EMOTION_MODEL_WARNING_EMITTED = True
+        print(f"[EMOTION] TensorFlow/Keras not available: {exc}. Emotion detection disabled.", file=sys.stderr)
         return None
 
     try:
@@ -96,6 +124,7 @@ def load_emotion_model() -> Optional[object]:
         if not EMOTION_MODEL_WARNING_EMITTED:
             print(f"[EMOTION] Failed to load emotion model: {exc}", file=sys.stderr)
             EMOTION_MODEL_WARNING_EMITTED = True
+        print(f"[EMOTION] Failed to load emotion model: {exc}", file=sys.stderr)
         return None
 
 smile_cascade_path = Path(cv2.data.haarcascades) / "haarcascade_smile.xml"
@@ -140,15 +169,7 @@ def _landmark_to_xy(landmarks, index: int, width: int, height: int) -> np.ndarra
 
 
 def compute_mediapipe_mouth_metrics(
-    landmarks, width: int, height: int
-) -> tuple[
-    Optional[float],
-    Optional[tuple[int, int, int, int]],
-    Optional[float],
-    Optional[float],
-    list[tuple[int, int]],
-    list[tuple[int, int]],
-]:
+    landmarks, width: int, height: int) -> Dict[str, Any]:
     """Return core mouth ratios plus outer/inner landmark rings for downstream cues."""
 
     left = _landmark_to_xy(landmarks, LEFT_MOUTH_INDEX, width, height)
@@ -158,7 +179,7 @@ def compute_mediapipe_mouth_metrics(
 
     horizontal = np.linalg.norm(left - right)
     if horizontal <= 1e-6:
-        return None, None, None, None, [], []
+        return {}
     vertical = np.linalg.norm(upper - lower)
     ratio = float(vertical / horizontal)
 
@@ -182,8 +203,14 @@ def compute_mediapipe_mouth_metrics(
 
     outer_int = [(int(round(pt[0])), int(round(pt[1]))) for pt in outer_ring]
     inner_int = [(int(round(pt[0])), int(round(pt[1]))) for pt in inner_ring]
-
-    return ratio, bbox, horizontal_ratio, smile_delta, outer_int, inner_int
+    return {
+        "ratio": ratio,
+        "bbox": bbox,
+        "horizontal": horizontal_ratio,
+        "smile_delta": smile_delta,
+        "outer_ring": outer_int,
+        "inner_ring": inner_int,
+    }
 
 
 def normalize_ratio(raw_ratio: float, baseline: float, spread: float) -> float:
@@ -292,6 +319,7 @@ def estimate_smile_with_cascade(gray_frame: np.ndarray, rect: tuple[int, int, in
 
 def detection_loop(show_preview: bool, use_mediapipe: bool) -> None:
     global latest_payload, running, EMOTION_MODEL_WARNING_EMITTED, emotion_model
+    global latest_payload, running, emotion_model
     print("[DETECTION] Detection loop started.")
 
     face_mesh = None
@@ -412,12 +440,14 @@ def detection_loop(show_preview: bool, use_mediapipe: bool) -> None:
             if face_mesh is not None:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = face_mesh.process(rgb_frame)
-                if results and results.multi_face_landmarks:
+                if MEDIAPIPE_AVAILABLE and results and results.multi_face_landmarks:
                     landmarks = results.multi_face_landmarks[0].landmark
-                    (open_ratio, bbox, horizontal, smile_delta, outer_points, inner_points) = compute_mediapipe_mouth_metrics(
-                        landmarks, width, height
-                    )
-                    if open_ratio is not None and horizontal is not None:
+                    metrics = compute_mediapipe_mouth_metrics(landmarks, width, height)
+
+                    if metrics:
+                        open_ratio, bbox, horizontal, smile_delta, outer_points, inner_points = (
+                            metrics.get("ratio"), metrics.get("bbox"), metrics.get("horizontal"), metrics.get("smile_delta"), metrics.get("outer_ring"), metrics.get("inner_ring")
+                        )
                         detection_source = "mediapipe"
                         best_mouth_rect = bbox
                         horizontal_ratio = horizontal
@@ -425,56 +455,59 @@ def detection_loop(show_preview: bool, use_mediapipe: bool) -> None:
                         inner_mouth_outline = inner_points or None
                         no_detection_frames = 0
 
-                        if open_ratio < mp_open_baseline + mp_open_range * 0.5:
-                            mp_open_baseline = float(np.clip(mp_open_baseline * 0.9 + open_ratio * 0.1, 0.02, 0.25))
-                        raw_open = normalize_ratio(open_ratio, mp_open_baseline, mp_open_range)
-                        open_norm = smoothing_open * previous_open + (1 - smoothing_open) * raw_open
+                        if open_ratio is not None:
+                            if open_ratio < mp_open_baseline + mp_open_range * 0.5:
+                                mp_open_baseline = float(np.clip(mp_open_baseline * 0.9 + open_ratio * 0.1, 0.02, 0.25))
+                            raw_open = normalize_ratio(open_ratio, mp_open_baseline, mp_open_range)
+                            open_norm = smoothing_open * previous_open + (1 - smoothing_open) * raw_open
 
-                        if mp_width_baseline is None:
-                            mp_width_baseline = horizontal
-                        else:
-                            mp_width_baseline = mp_width_baseline * 0.92 + horizontal * 0.08
-
-                        raw_pucker = 0.0
-                        raw_wide = 0.0
-                        if mp_width_baseline is not None:
-                            raw_pucker = float(np.clip((mp_width_baseline - horizontal) / mp_width_range, 0.0, 1.0))
-                            raw_wide = float(np.clip((horizontal - mp_width_baseline) / mp_width_range, 0.0, 1.0))
-                        pucker_norm = smoothing_pucker * previous_pucker + (1 - smoothing_pucker) * raw_pucker
-                        wide_norm = smoothing_wide * previous_wide + (1 - smoothing_wide) * raw_wide
-
-                        if smile_delta is not None:
-                            if mp_smile_baseline is None:
-                                mp_smile_baseline = smile_delta
+                        if horizontal is not None:
+                            if mp_width_baseline is None:
+                                mp_width_baseline = horizontal
                             else:
-                                if smile_delta <= (mp_smile_baseline + 0.01):
-                                    mp_smile_baseline = mp_smile_baseline * 0.9 + smile_delta * 0.1
-                                else:
-                                    mp_smile_baseline = mp_smile_baseline * 0.98 + smile_delta * 0.02
-                            smile_raw = float(np.clip((smile_delta - (mp_smile_baseline or 0.0)) / mp_smile_range, 0.0, 1.0))
-                            smile_norm = smoothing_smile * previous_smile + (1 - smoothing_smile) * smile_raw
+                                mp_width_baseline = mp_width_baseline * 0.92 + horizontal * 0.08
 
-                        left_corner = _landmark_to_xy(landmarks, LEFT_MOUTH_INDEX, width, height)
-                        right_corner = _landmark_to_xy(landmarks, RIGHT_MOUTH_INDEX, width, height)
-                        mouth_span = float(np.linalg.norm(left_corner - right_corner))
-                        if mouth_span > 1e-3:
-                            mouth_center = (left_corner + right_corner) * 0.5
-                            nose_tip = _landmark_to_xy(landmarks, NOSE_TIP_INDEX, width, height)
-                            center_offset = float((mouth_center[0] - nose_tip[0]) / mouth_span)
-                            if mp_center_baseline is None:
-                                mp_center_baseline = center_offset
-                            else:
-                                if abs(center_offset - mp_center_baseline) < 0.18:
-                                    mp_center_baseline = mp_center_baseline * 0.92 + center_offset * 0.08
+                            raw_pucker = 0.0
+                            raw_wide = 0.0
+                            if mp_width_baseline is not None:
+                                raw_pucker = float(np.clip((mp_width_baseline - horizontal) / mp_width_range, 0.0, 1.0))
+                                raw_wide = float(np.clip((horizontal - mp_width_baseline) / mp_width_range, 0.0, 1.0))
+                            pucker_norm = smoothing_pucker * previous_pucker + (1 - smoothing_pucker) * raw_pucker
+                            wide_norm = smoothing_wide * previous_wide + (1 - smoothing_wide) * raw_wide
+
+                            if smile_delta is not None:
+                                if mp_smile_baseline is None:
+                                    mp_smile_baseline = smile_delta
                                 else:
-                                    mp_center_baseline = mp_center_baseline * 0.985 + center_offset * 0.015
-                            shift_raw = float(np.clip((center_offset - (mp_center_baseline or 0.0)) / mp_shift_range, -1.0, 1.0))
-                            shift_norm = smoothing_shift * previous_shift + (1 - smoothing_shift) * shift_raw
+                                    if smile_delta <= (mp_smile_baseline + 0.01):
+                                        mp_smile_baseline = mp_smile_baseline * 0.9 + smile_delta * 0.1
+                                    else:
+                                        mp_smile_baseline = mp_smile_baseline * 0.98 + smile_delta * 0.02
+                                smile_raw = float(np.clip((smile_delta - (mp_smile_baseline or 0.0)) / mp_smile_range, 0.0, 1.0))
+                                smile_norm = smoothing_smile * previous_smile + (1 - smoothing_smile) * smile_raw
+
+                            left_corner = _landmark_to_xy(landmarks, LEFT_MOUTH_INDEX, width, height)
+                            right_corner = _landmark_to_xy(landmarks, RIGHT_MOUTH_INDEX, width, height)
+                            mouth_span = float(np.linalg.norm(left_corner - right_corner))
+                            if mouth_span > 1e-3:
+                                mouth_center = (left_corner + right_corner) * 0.5
+                                nose_tip = _landmark_to_xy(landmarks, NOSE_TIP_INDEX, width, height)
+                                center_offset = float((mouth_center[0] - nose_tip[0]) / mouth_span)
+                                if mp_center_baseline is None:
+                                    mp_center_baseline = center_offset
+                                else:
+                                    if abs(center_offset - mp_center_baseline) < 0.18:
+                                        mp_center_baseline = mp_center_baseline * 0.92 + center_offset * 0.08
+                                    else:
+                                        mp_center_baseline = mp_center_baseline * 0.985 + center_offset * 0.015
+                                shift_raw = float(np.clip((center_offset - (mp_center_baseline or 0.0)) / mp_shift_range, -1.0, 1.0))
+                                shift_norm = smoothing_shift * previous_shift + (1 - smoothing_shift) * shift_raw
 
                         if inner_points:
                             tongue_raw = 0.0
                             if open_norm > 0.16:
                                 tongue_raw = estimate_tongue_presence(frame, polygon=inner_points)
+                                tongue_raw = estimate_tongue_presence(frame, polygon=outer_points)
                             tongue_norm = smoothing_tongue * previous_tongue + (1 - smoothing_tongue) * tongue_raw
 
             if detection_source == "none":
@@ -502,6 +535,9 @@ def detection_loop(show_preview: bool, use_mediapipe: bool) -> None:
                     if best_mouth_rect is None or rw * rh > best_mouth_rect[2] * best_mouth_rect[3]:
                         best_mouth_rect = candidate
                         last_face = (fx, fy, fw, fh)
+                    # Simple heuristic for mouth ROI based on face
+                    best_mouth_rect = (fx, fy + int(fh * 0.6), fw, int(fh * 0.4))
+                    last_face = (fx, fy, fw, fh)
 
                 if best_mouth_rect is None:
                     mouths = mouth_cascade.detectMultiScale(gray, scaleFactor=1.18, minNeighbors=5, minSize=(50, 32))
@@ -612,6 +648,7 @@ def detection_loop(show_preview: bool, use_mediapipe: bool) -> None:
                             if not EMOTION_MODEL_WARNING_EMITTED:
                                 print(f"[EMOTION] Inference error: {exc}", file=sys.stderr)
                                 EMOTION_MODEL_WARNING_EMITTED = True
+                            print(f"[EMOTION] Inference error: {exc}", file=sys.stderr)
                             local_emotion_model = None
                             with emotion_model_lock:
                                 emotion_model = None
@@ -789,6 +826,7 @@ async def main() -> None:
         "--disable-mediapipe",
         action="store_true",
         help="Disable MediaPipe FaceMesh and use Haar cascades only",
+        help="Disable MediaPipe FaceMesh and use Haar cascades only (if mediapipe is not installed, this is default).",
     )
     args = parser.parse_args()
 
@@ -823,6 +861,7 @@ async def main() -> None:
         print(f"Camera initialised using index {args.camera_index}.")
 
     global emotion_model
+    global emotion_model, MEDIAPIPE_AVAILABLE
     with emotion_model_lock:
         if emotion_model is None:
             emotion_model = load_emotion_model()
@@ -831,6 +870,7 @@ async def main() -> None:
         target=detection_loop,
         args=(args.preview, use_mediapipe),
         daemon=True,
+        daemon=True
     )
     detection_thread.start()
 
@@ -863,3 +903,7 @@ if __name__ == "__main__":
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, shutdown_handler)
     asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, RuntimeError):
+        shutdown_handler()

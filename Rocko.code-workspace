@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		}
+	],
+	"settings": {
+		"python.analysis.typeCheckingMode": "basic",
+		"cSpell.words": [
+			"chjsh"
+		],
+		"inlineChat.enableV2": true
+	}
+}
